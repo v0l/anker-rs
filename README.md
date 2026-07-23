@@ -1,62 +1,76 @@
 # anker-rs
 
-A tiny Rust library (`anker_solix`) and CLI (`anker`) for monitoring and
-controlling **Anker SOLIX** portable power stations over **Bluetooth LE** — no
-cloud, no account, and no 200 MB app.
+A small, dependency-light Rust **library** (`anker_solix`) and **CLI** (`anker`)
+for talking to **Anker SOLIX** portable power stations directly over
+**Bluetooth LE**.
 
-Confirmed working on real hardware against a **SOLIX C1000 Gen 2** (A1763):
-telemetry read, AC/DC output control, and the full encrypted handshake.
+> ⚠️ **For educational and research purposes only.** Independent project,
+> **not** affiliated with or endorsed by Anker. Provided "AS IS" with no
+> warranty — see [Legal & disclaimer](#legal--disclaimer) before use.
+
+---
 
 ## Features
 
-- 🔍 Scan for nearby SOLIX devices
-- 🔐 Full ECDH (secp256r1) + AES-128-CBC session negotiation (matches app firmware)
-- 🔋 Battery %, health, charge limits, temperature
-- ⚡ Power in/out and per-port status/watts (AC, DC 12 V, solar, USB-C/A)
-- 🎛️ Toggle AC and DC outputs
-- 🧾 Serial / part number / firmware
-- 📤 Text or JSON output
+- **Scan** for nearby SOLIX stations and identify the model from its BLE name.
+- **Read telemetry** — battery %, charge/discharge limits, temperature, total
+  power in/out, and per-port status + watts (AC, DC 12 V, solar, USB-C/A).
+- **Control outputs** — toggle the AC and DC rails (and, via the library, the
+  LCD display and ambient light).
+- **Session security** — performs the station's ECDH (secp256r1) key agreement
+  and AES-128 encrypted framing, including the gen-2 AES-GCM channel.
+- **Two front-ends** — a `anker` command-line tool and an embeddable async
+  library.
+- **Text or JSON** output.
 
-## Supported models
+## Supported hardware
 
-| Model | Telemetry | Control | Notes |
-|-------|-----------|---------|-------|
-| C1000 Gen 2 (A1763) | ✅ tested | ✅ tested | Needs `4100` subscribe; telemetry on `c421`/`c900`; AC `4101`, DC `4102` |
-| C300 / C800 / C1000 gen 1, F2000, F3800 | ⚠️ implemented | ⚠️ implemented | Gen-1 layout; not yet verified here |
+| Model | Status |
+|-------|--------|
+| SOLIX **C1000 Gen 2** (A1763) | Tested on real hardware — telemetry + AC/DC control |
+| C300 / C800 / C1000 gen 1, F2000, F3800 | Implemented (gen-1 framing); not independently verified |
 
-Model is auto-detected from the advertised BLE name.
+The model is auto-detected from the advertised BLE name.
 
-## Build
+## Install
+
+Requires a recent stable Rust toolchain (edition 2024, Rust ≥ 1.85).
 
 ```bash
+git clone https://github.com/v0l/anker-rs
+cd anker-rs
 cargo build --release
+# binary at target/release/anker
 ```
 
-> **macOS:** grant your terminal app Bluetooth permission
-> (System Settings → Privacy & Security → Bluetooth) or scans return nothing.
-> macOS also masks the MAC address, so target devices by name.
-
-## Usage
+## CLI
 
 ```bash
-# List nearby stations
+# list nearby stations
 anker scan
 
-# One telemetry snapshot (targets a name substring by default: "C1000")
+# one telemetry snapshot (defaults to targeting a name containing "C1000")
 anker status
 anker -d "C1000" status
 anker -f json status
 
-# Live stream until Ctrl-C
+# stream telemetry until Ctrl-C
 anker monitor
+anker monitor --interval 5
 
-# Control outputs
-anker dc on
-anker ac off
+# control outputs
+anker ac on
+anker dc off
 ```
 
-Global flags: `-d/--device <name|mac>`, `--scan-secs <n>`, `-f/--format text|json`,
-`-v` / `-vv` for logging.
+Global flags:
+
+| Flag | Meaning |
+|------|---------|
+| `-d, --device <name\|mac>` | Target a device by BLE name substring or MAC |
+| `--scan-secs <n>` | How long to scan when locating a device |
+| `-f, --format <text\|json>` | Output format |
+| `-v`, `-vv` | Increase log verbosity |
 
 ## Library
 
@@ -66,32 +80,56 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> anker_solix::Result<()> {
+    // Find a station whose BLE name contains "C1000" and connect.
     let mut dev = Device::find_and_connect("C1000", 6).await?;
+
+    // Read a telemetry snapshot.
     let t = dev.next_telemetry(Duration::from_secs(10)).await?;
-    println!("battery {:?}%", t.battery_percentage);
+    println!("battery: {:?}%", t.battery_percentage);
+
+    // Toggle the DC output.
     dev.set_dc(true).await?;
     Ok(())
 }
 ```
 
+Key entry points: [`Device::scan`], [`Device::find_and_connect`],
+[`Device::next_telemetry`], and the `set_ac` / `set_dc` / `set_display` /
+`set_light` controls. Add `anker_solix` as a path or git dependency in your
+`Cargo.toml`.
+
 ## How it works
 
-1. **Discover** — scan for the advertised identifier service `0000ff09-…`.
-2. **Negotiate** — a fixed 6-stage handshake on the command characteristic
-   (`8c85_0002-…`). The client private key is fixed, so every outbound frame is
-   constant; the station returns an ephemeral public key which is combined via
-   ECDH into a 32-byte secret (key = first 16 bytes, IV = last 16).
-3. **Session** — telemetry arrives on the notify characteristic (`8c85_0003-…`)
-   as `0xFF09`-framed packets, reassembled from fragments and AES-CBC decrypted
-   into TLV parameters. Commands are encrypted the same way with a rolling
-   timestamp for replay protection.
+The station exposes a small GATT service. In brief:
 
-## Credits & disclaimer
+1. **Discover** — scan for the advertised identifier service (`0000ff09-…`).
+2. **Negotiate** — a fixed handshake on the command characteristic performs an
+   ECDH (secp256r1) key agreement, yielding a session key used for AES framing.
+3. **Session** — telemetry arrives on the notify characteristic as length-framed
+   packets, reassembled from fragments and decrypted into TLV parameters;
+   commands are sent back the same way.
 
-Protocol details build on the prior work in
-[flip-dots/SolixBLE](https://github.com/flip-dots/SolixBLE) (MIT). This project
-is unofficial and not affiliated with Anker. Use at your own risk.
+## Platform notes
+
+- **macOS:** grant your terminal app Bluetooth permission
+  (System Settings → Privacy & Security → Bluetooth) or scans return nothing.
+  macOS also masks device MAC addresses, so target devices by **name**.
+- Only one BLE connection to a station at a time — close the official app first.
+
+## Credits
+
+Builds on prior community work in
+[flip-dots/SolixBLE](https://github.com/flip-dots/SolixBLE) (MIT).
+
+## Legal & disclaimer
+
+For **educational and research purposes only**. Independent project, **not**
+affiliated with or endorsed by Anker; "Anker" and "SOLIX" are trademarks of
+their respective owners, used only to identify compatible hardware. Contains no
+Anker code, firmware, or assets. Provided **"AS IS" with no warranty** — BLE
+interaction may change settings, damage the device, or void its warranty, and
+you use it entirely at your own risk.
 
 ## License
 
-MIT
+[MIT](LICENSE)
