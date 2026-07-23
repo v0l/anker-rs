@@ -232,6 +232,17 @@ impl Device {
         Ok(())
     }
 
+    /// Fire-and-forget write (no ATT response wait). Used for control commands:
+    /// some SOLIX firmwares don't send a write-response for output-control
+    /// writes, so a with-response write blocks forever. The command's effect is
+    /// confirmed out-of-band via the telemetry stream instead.
+    async fn write_raw_no_ack(&mut self, bytes: &[u8]) -> Result<()> {
+        self.peripheral
+            .write(&self.cmd_char, bytes, WriteType::WithoutResponse)
+            .await?;
+        Ok(())
+    }
+
     /// Run the fixed ECDH handshake until an encrypted session is established.
     async fn negotiate(&mut self) -> Result<()> {
         self.write_raw(&hex::decode(NEGOTIATION_COMMAND_0).unwrap())
@@ -320,6 +331,19 @@ impl Device {
     /// notification stream is not `Sync`; this lets `Device` be driven from
     /// `Send` async contexts (e.g. trait objects).
     pub async fn send_command(&mut self, cmd: [u8; 2], payload: &[u8]) -> Result<()> {
+        let packet = self.build_command_packet(cmd, payload);
+        self.write_raw(&packet).await
+    }
+
+    /// Like [`send_command`](Self::send_command) but fire-and-forget (no ATT
+    /// response wait). For output-control commands the device confirms via
+    /// telemetry, and some firmwares never send a write-response.
+    pub async fn send_command_no_ack(&mut self, cmd: [u8; 2], payload: &[u8]) -> Result<()> {
+        let packet = self.build_command_packet(cmd, payload);
+        self.write_raw_no_ack(&packet).await
+    }
+
+    fn build_command_packet(&self, cmd: [u8; 2], payload: &[u8]) -> Vec<u8> {
         let elapsed = self.negotiated_at.elapsed().as_secs() as u32;
         let timestamp = BASE_TIMESTAMP_LE.wrapping_add(elapsed);
 
@@ -329,8 +353,7 @@ impl Device {
         full.extend_from_slice(&timestamp.to_le_bytes());
 
         let ciphertext = encrypt(&self.shared_secret, &full);
-        let packet = build_packet(PATTERN_ENCRYPTED_TX, cmd, &ciphertext);
-        self.write_raw(&packet).await
+        build_packet(PATTERN_ENCRYPTED_TX, cmd, &ciphertext)
     }
 
     /// Read the next framed packet from the notification stream (any pattern).
@@ -549,13 +572,13 @@ impl Device {
 
     /// Turn the AC output on or off.
     pub async fn set_ac(&mut self, on: bool) -> Result<()> {
-        self.send_command(self.model.cmd_ac_output(), crate::model::on_off_payload(on))
+        self.send_command_no_ack(self.model.cmd_ac_output(), crate::model::on_off_payload(on))
             .await
     }
 
     /// Turn the DC (12 V) output on or off.
     pub async fn set_dc(&mut self, on: bool) -> Result<()> {
-        self.send_command(self.model.cmd_dc_output(), crate::model::on_off_payload(on))
+        self.send_command_no_ack(self.model.cmd_dc_output(), crate::model::on_off_payload(on))
             .await
     }
 
@@ -570,7 +593,7 @@ impl Device {
                 self.model
             ))
         })?;
-        self.send_command(cmd, &crate::model::light_mode_payload(brightness))
+        self.send_command_no_ack(cmd, &crate::model::light_mode_payload(brightness))
             .await
     }
 
@@ -585,11 +608,12 @@ impl Device {
                 self.model
             ))
         })?;
-        self.send_command(cmd, crate::model::on_off_payload(on)).await
+        self.send_command_no_ack(cmd, crate::model::on_off_payload(on))
+            .await
     }
 
     /// Disconnect from the device.
-    pub async fn disconnect(&self) -> Result<()> {
+    pub async fn disconnect(&mut self) -> Result<()> {
         self.peripheral.disconnect().await?;
         Ok(())
     }

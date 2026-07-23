@@ -22,6 +22,7 @@ pub mod crypto;
 pub mod device;
 pub mod error;
 pub mod model;
+pub mod opcode;
 pub mod protocol;
 
 pub use device::{scan, Device, Discovered};
